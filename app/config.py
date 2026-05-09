@@ -49,6 +49,22 @@ class Settings(BaseSettings):
     # Minutes before an unfilled limit order is cancelled and replaced with market.
     option_limit_timeout_min: int = 5
 
+    # Contract selection — liquidity filters
+    # Minimum open interest to consider a contract tradeable.
+    option_min_open_interest: int = 100
+
+    # Maximum bid/ask spread as a fraction of mid-price (0.15 = 15%).
+    # Contracts wider than this are skipped.
+    option_max_spread_pct: float = 0.15
+
+    # Number of closest-strike candidates to fetch quotes for before
+    # picking the tightest spread.
+    option_max_candidates: int = 5
+
+    # Prefer standard monthly expiries (3rd Friday) over weeklies.
+    # Monthlies typically have higher OI and tighter spreads.
+    option_prefer_monthly: bool = True
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
 

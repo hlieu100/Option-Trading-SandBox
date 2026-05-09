@@ -189,15 +189,17 @@ def find_option_contract(
     dte_target: int = 30,
 ) -> str:
     """
-    Find the best-matching ATM call contract for `ticker`.
+    Find the best call contract for `ticker` using a 4-stage filter:
 
-    Strategy:
-    - Search for call contracts expiring between DTE-10 and DTE+20 days out.
-    - Filter to strikes within 5% of the suggested strike (or current price).
-    - Pick the contract closest to the target strike with the nearest expiry.
-    - Returns the OCC option symbol string (e.g. "NVDA260117C00215000").
+    1. Expiry window   — between DTE-10 and DTE+20 days out
+    2. Open interest   — drop contracts below option_min_open_interest
+    3. Monthly filter  — prefer standard monthly (3rd-Friday) expiries
+    4. Spread quality  — fetch quotes for top candidates, pick tightest
+                         bid/ask spread that is within option_max_spread_pct
+
+    Returns the OCC option symbol string (e.g. "NVDA260117C00215000").
     """
-    today = date.today()
+    today    = date.today()
     exp_from = today + timedelta(days=max(7, dte_target - 10))
     exp_to   = today + timedelta(days=dte_target + 20)
 
@@ -209,37 +211,117 @@ def find_option_contract(
         status=AssetStatus.ACTIVE,
     )
 
-    contracts = get_client().get_option_contracts(req)
-
-    if not contracts or not contracts.option_contracts:
+    result   = get_client().get_option_contracts(req)
+    if not result or not result.option_contracts:
         raise ValueError(
             f"No active call contracts found for {ticker} "
             f"between {exp_from} and {exp_to}."
         )
 
-    options = contracts.option_contracts
-
-    # Use provided strike or fall back to latest stock price
+    options = result.option_contracts
     reference_strike = strike or get_latest_price(ticker) or 0.0
 
-    # Sort: nearest expiry first, then closest strike to reference
-    options.sort(key=lambda c: (
+    # ── Stage 1: open interest filter ─────────────────────────────────────────
+    min_oi = settings.option_min_open_interest
+    liquid = [c for c in options if int(c.open_interest or 0) >= min_oi]
+    if not liquid:
+        log.warning(
+            "No contracts meet min OI — relaxing OI filter",
+            extra={"ticker": ticker, "min_oi": min_oi},
+        )
+        liquid = options
+
+    # ── Stage 2: monthly vs weekly preference ─────────────────────────────────
+    if settings.option_prefer_monthly:
+        monthly = [c for c in liquid if _is_monthly_expiry(c.expiration_date)]
+        if monthly:
+            liquid = monthly
+        else:
+            log.info(
+                "No monthly expiries available — using all expiries",
+                extra={"ticker": ticker},
+            )
+
+    # ── Stage 3: sort by nearest expiry, then closest strike ──────────────────
+    liquid.sort(key=lambda c: (
         c.expiration_date,
         abs(float(c.strike_price) - reference_strike),
     ))
 
-    chosen = options[0]
+    # ── Stage 4: fetch quotes for top N, pick tightest spread ─────────────────
+    candidates = liquid[: settings.option_max_candidates]
+    symbols    = [c.symbol for c in candidates]
+
+    try:
+        quote_req = OptionLatestQuoteRequest(symbol_or_symbols=symbols)
+        quotes    = get_option_data_client().get_option_latest_quote(quote_req)
+    except Exception as exc:
+        log.warning(
+            "Could not fetch option quotes — falling back to nearest strike",
+            extra={"ticker": ticker, "error": str(exc)},
+        )
+        chosen = candidates[0]
+        log.info("Option contract selected (no-quote fallback)",
+                 extra={"contract": chosen.symbol, "strike": str(chosen.strike_price)})
+        return chosen.symbol
+
+    def _spread_ratio(contract) -> float:
+        """Return bid/ask spread as fraction of mid-price. inf if unusable."""
+        q = quotes.get(contract.symbol)
+        if not q:
+            return float("inf")
+        bid = float(q.bid_price or 0)
+        ask = float(q.ask_price or 0)
+        if ask <= 0:
+            return float("inf")
+        mid = (bid + ask) / 2
+        if mid <= 0:
+            return float("inf")
+        return (ask - bid) / mid
+
+    max_spread = settings.option_max_spread_pct
+    valid = [c for c in candidates if _spread_ratio(c) <= max_spread]
+    if not valid:
+        log.warning(
+            "All candidates exceed max spread — using tightest available",
+            extra={"ticker": ticker, "max_spread_pct": max_spread},
+        )
+        valid = candidates
+
+    # Final sort: tightest spread first, then closest to target strike
+    valid.sort(key=lambda c: (
+        _spread_ratio(c),
+        abs(float(c.strike_price) - reference_strike),
+    ))
+
+    chosen = valid[0]
+    q = quotes.get(chosen.symbol)
+    bid = float(q.bid_price or 0) if q else 0
+    ask = float(q.ask_price or 0) if q else 0
+
     log.info(
         "Option contract selected",
         extra={
-            "ticker":      ticker,
-            "contract":    chosen.symbol,
-            "strike":      str(chosen.strike_price),
-            "expiry":      str(chosen.expiration_date),
-            "ref_strike":  reference_strike,
+            "ticker":        ticker,
+            "contract":      chosen.symbol,
+            "strike":        str(chosen.strike_price),
+            "expiry":        str(chosen.expiration_date),
+            "open_interest": str(chosen.open_interest),
+            "bid":           bid,
+            "ask":           ask,
+            "spread_pct":    f"{_spread_ratio(chosen):.1%}",
+            "ref_strike":    reference_strike,
         },
     )
     return chosen.symbol
+
+
+def _is_monthly_expiry(exp_date) -> bool:
+    """Return True if exp_date falls on the 3rd Friday of its month."""
+    from calendar import monthcalendar, FRIDAY
+    d = exp_date if isinstance(exp_date, date) else date.fromisoformat(str(exp_date))
+    fridays = [week[FRIDAY] for week in monthcalendar(d.year, d.month) if week[FRIDAY] != 0]
+    return len(fridays) >= 3 and d.day == fridays[2]
 
 
 @_retry
