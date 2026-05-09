@@ -95,9 +95,11 @@ async def handle_option_signal(payload: AlertPayload) -> Dict[str, Any]:
 
     # ── CLOSE CALL ────────────────────────────────────────────────────────────
     if action == "close_call":
-        is_stop_loss = signal_type == "stop_loss"
+        # Use market if Pine explicitly says "market" OR if it's a stop loss.
+        # Stop loss always overrides to market regardless of order_type field.
+        use_market = (order_type == "market") or (signal_type == "stop_loss")
 
-        if is_stop_loss:
+        if use_market:
             # Market close — speed matters on stop loss
             orders = ac.close_option_positions(ticker)
             result["orders"] = [_order_summary(o) for o in orders]
@@ -105,8 +107,8 @@ async def handle_option_signal(payload: AlertPayload) -> Dict[str, Any]:
             if not orders:
                 result["note"] = "No open option positions to close."
             log.info(
-                "Option STOP LOSS market close",
-                extra={"ticker": ticker, "orders_count": len(orders)},
+                "Option market close",
+                extra={"ticker": ticker, "type": signal_type, "orders_count": len(orders)},
             )
         else:
             # Limit sell at mid-price with timeout fallback
