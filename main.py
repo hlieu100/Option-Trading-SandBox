@@ -94,6 +94,7 @@ def get_best_alpaca_contract(underlying_symbol: str, side: str, timeframe: str) 
             return None
 
         best = min(contracts, key=lambda x: abs(float(x.strike_price) - current_price))
+        print(f"ATM selected: {best.symbol} strike={best.strike_price} vs current={current_price} from {len(contracts)} contracts")
         return best.symbol
 
     except Exception as e:
@@ -164,6 +165,40 @@ async def _limit_timeout(order_id: str, symbol: str, qty: int, timeout_min: int)
 @app.get("/")
 def health_check():
     return {"status": "online", "message": "Trading bot is active"}
+
+@app.get("/debug/{ticker}")
+def debug_price(ticker: str):
+    """Show current price and available ATM contracts for a ticker."""
+    try:
+        trade_req = StockLatestTradeRequest(symbol_or_symbols=[ticker])
+        trade     = stock_data_client.get_stock_latest_trade(trade_req)
+        price     = float(trade[ticker].price)
+    except Exception as e:
+        return {"error": f"Could not fetch price: {e}"}
+
+    from datetime import date, timedelta
+    min_date = date.today() + timedelta(days=25)
+    max_date = date.today() + timedelta(days=35)
+    try:
+        result    = trading_client.get_option_contracts(GetOptionContractsRequest(
+            underlying_symbols=[ticker], status=AssetStatus.ACTIVE,
+            expiration_date_gte=min_date, expiration_date_lte=max_date,
+            type=ContractType.CALL
+        ))
+        contracts = result.option_contracts or []
+        strikes   = sorted([float(c.strike_price) for c in contracts])
+        closest   = min(strikes, key=lambda s: abs(s - price)) if strikes else None
+    except Exception as e:
+        return {"price": price, "error": f"Contract search failed: {e}"}
+
+    return {
+        "ticker":          ticker,
+        "current_price":   price,
+        "window":          f"{min_date} to {max_date}",
+        "contracts_found": len(strikes),
+        "closest_strike":  closest,
+        "all_strikes":     strikes[:20],
+    }
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
