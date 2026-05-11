@@ -6,7 +6,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetStatus, ContractType
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest, OptionLatestQuoteRequest
+from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest, OptionLatestQuoteRequest
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -57,9 +57,16 @@ def get_option_mid_price(contract_symbol: str) -> float:
 def get_best_alpaca_contract(underlying_symbol: str, side: str, timeframe: str) -> str | None:
     """Find ATM option contract. side: 'buy'=CALL, 'sell'=PUT."""
     try:
-        quote_req     = StockLatestQuoteRequest(symbol_or_symbols=[underlying_symbol])
-        quote         = stock_data_client.get_stock_latest_quote(quote_req)
-        current_price = quote[underlying_symbol].ask_price
+        # Use last trade price — more reliable than ask (works outside market hours)
+        try:
+            trade_req     = StockLatestTradeRequest(symbol_or_symbols=[underlying_symbol])
+            trade         = stock_data_client.get_stock_latest_trade(trade_req)
+            current_price = float(trade[underlying_symbol].price)
+        except Exception:
+            quote_req     = StockLatestQuoteRequest(symbol_or_symbols=[underlying_symbol])
+            quote         = stock_data_client.get_stock_latest_quote(quote_req)
+            current_price = float(quote[underlying_symbol].ask_price or quote[underlying_symbol].bid_price)
+        print(f"Current price for {underlying_symbol}: {current_price}")
 
         if timeframe == "60":
             min_days, max_days = 40, 50
