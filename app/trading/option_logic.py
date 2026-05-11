@@ -19,7 +19,7 @@ import logging
 from typing import Any, Dict
 
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import OrderSide
+from alpaca.trading.enums import ContractType, OrderSide
 
 from app.models import AlertPayload
 from app.trading import alpaca_client as ac
@@ -141,6 +141,91 @@ async def handle_option_signal(payload: AlertPayload) -> Dict[str, Any]:
                 except APIError as exc:
                     log.error(
                         "Failed to place option sell",
+                        extra={"symbol": pos.symbol, "error": str(exc)},
+                    )
+
+            result["status"] = "submitted" if result["orders"] else "ignored"
+
+        return result
+
+    # ── BUY PUT ───────────────────────────────────────────────────────────────
+    if action == "buy_put":
+        contract_symbol = ac.find_option_contract(
+            ticker, strike, dte, contract_type=ContractType.PUT
+        )
+        result["contract"] = contract_symbol
+
+        if order_type == "limit":
+            mid_price = ac.get_option_mid_price(contract_symbol)
+            order     = ac.place_option_limit_order(
+                contract_symbol, OrderSide.BUY, contracts, mid_price
+            )
+            result["orders"].append(_order_summary(order))
+            result["limit_price"] = mid_price
+            result["status"] = "submitted"
+            asyncio.create_task(
+                _limit_timeout(
+                    order_id    = str(order.id),
+                    symbol      = contract_symbol,
+                    side        = OrderSide.BUY,
+                    qty         = contracts,
+                    timeout_min = timeout_min,
+                )
+            )
+        else:
+            order = ac.place_option_market_order(contract_symbol, OrderSide.BUY, contracts)
+            result["orders"].append(_order_summary(order))
+            result["status"] = "submitted"
+
+        log.info(
+            "Option BUY PUT submitted",
+            extra={"ticker": ticker, "type": signal_type, "contract": contract_symbol, "qty": contracts},
+        )
+        return result
+
+    # ── CLOSE PUT ─────────────────────────────────────────────────────────────
+    if action == "close_put":
+        use_market = (order_type == "market") or (signal_type == "stop_loss")
+
+        if use_market:
+            orders = ac.close_option_positions(ticker)
+            result["orders"] = [_order_summary(o) for o in orders]
+            result["status"]  = "submitted" if orders else "ignored"
+            if not orders:
+                result["note"] = "No open option positions to close."
+            log.info(
+                "Option market close (PUT)",
+                extra={"ticker": ticker, "type": signal_type, "orders_count": len(orders)},
+            )
+        else:
+            positions = ac.get_option_positions(ticker)
+            if not positions:
+                result["status"] = "ignored"
+                result["note"]   = "No open option positions found."
+                return result
+
+            for pos in positions:
+                qty = int(float(pos.qty or 0))
+                if qty <= 0:
+                    continue
+                try:
+                    mid_price = ac.get_option_mid_price(pos.symbol)
+                    order     = ac.place_option_limit_order(
+                        pos.symbol, OrderSide.SELL, qty, mid_price
+                    )
+                    result["orders"].append(_order_summary(order))
+                    asyncio.create_task(
+                        _limit_timeout(
+                            order_id    = str(order.id),
+                            symbol      = pos.symbol,
+                            side        = OrderSide.SELL,
+                            qty         = qty,
+                            timeout_min = timeout_min,
+                        )
+                    )
+                except APIError as exc:
+                    log.error(
+                        "Failed to place option sell (PUT)",
                         extra={"symbol": pos.symbol, "error": str(exc)},
                     )
 

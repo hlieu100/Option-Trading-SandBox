@@ -187,9 +187,12 @@ def find_option_contract(
     ticker: str,
     strike: Optional[float],
     dte_target: int = 30,
+    contract_type: ContractType = ContractType.CALL,
 ) -> str:
     """
-    Find the best call contract for `ticker` using a 4-stage filter:
+    Find the best option contract for `ticker` using a 4-stage filter.
+
+    contract_type: ContractType.CALL (default) or ContractType.PUT
 
     1. Expiry window   — between DTE-10 and DTE+20 days out
     2. Open interest   — drop contracts below option_min_open_interest
@@ -207,14 +210,14 @@ def find_option_contract(
         underlying_symbols=[ticker],
         expiration_date_gte=exp_from,
         expiration_date_lte=exp_to,
-        type=ContractType.CALL,
+        type=contract_type,
         status=AssetStatus.ACTIVE,
     )
 
     result   = get_client().get_option_contracts(req)
     if not result or not result.option_contracts:
         raise ValueError(
-            f"No active call contracts found for {ticker} "
+            f"No active {contract_type.value} contracts found for {ticker} "
             f"between {exp_from} and {exp_to}."
         )
 

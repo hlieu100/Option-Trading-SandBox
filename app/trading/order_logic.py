@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 
 LEVERAGE_FACTOR = 0.5
 
-_OPTION_ACTIONS = {"buy_call", "close_call"}
+_OPTION_ACTIONS = {"buy_call", "close_call", "buy_put", "close_put"}
 
 
 # ── Public entry point ────────────────────────────────────────────────────────

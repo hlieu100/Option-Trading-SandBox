@@ -23,6 +23,8 @@ class TradingSignal(str, Enum):
     # Options signals
     BUY_CALL   = "buy_call"
     CLOSE_CALL = "close_call"
+    BUY_PUT    = "buy_put"
+    CLOSE_PUT  = "close_put"
 
 
 class AlertPayload(BaseModel):
@@ -117,6 +119,8 @@ class AlertPayload(BaseModel):
             "support notice":  "support_notice",
             "buy call":        "buy_call",
             "close call":      "close_call",
+            "buy put":         "buy_put",
+            "close put":       "close_put",
         }
         return mapping.get(v, v)
 
