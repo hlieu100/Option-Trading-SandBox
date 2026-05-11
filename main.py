@@ -53,7 +53,7 @@ def get_best_alpaca_contract(underlying_symbol, side, timeframe):
         max_date = datetime.now() + timedelta(days=max_days)
 
         search_params = GetOptionContractsRequest(
-            underlying_symbol=[underlying_symbol],
+            underlying_symbols=[underlying_symbol],
             status=AssetStatus.ACTIVE,
             expiration_date_gte=min_date.date(),
             expiration_date_lte=max_date.date(),
@@ -79,8 +79,12 @@ def close_all_for_ticker(ticker):
     try:
         positions = trading_client.get_all_positions()
         closed = []
-        for p in positions:
-            if ticker in p.symbol:
+        # Match by ticker prefix first; fall back to all option positions
+        matched = [p for p in positions if p.symbol.startswith(ticker)]
+        if not matched:
+            matched = [p for p in positions if len(p.symbol) > 6 and not p.symbol.isalpha()]
+        for p in matched:
+            try:
                 order_data = MarketOrderRequest(
                     symbol=p.symbol,
                     qty=p.qty,
@@ -89,6 +93,8 @@ def close_all_for_ticker(ticker):
                 )
                 trading_client.submit_order(order_data)
                 closed.append(p.symbol)
+            except Exception:
+                pass
         return closed
     except Exception as e:
         print(f"Error closing positions: {e}")
