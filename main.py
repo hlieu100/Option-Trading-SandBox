@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetStatus, ContractType
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
