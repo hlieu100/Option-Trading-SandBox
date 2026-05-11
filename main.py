@@ -1,11 +1,12 @@
+import asyncio
 import os
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOptionContractsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetStatus, ContractType
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
+from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest, OptionLatestQuoteRequest
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,15 +17,13 @@ app = FastAPI()
 API_KEY      = os.getenv("ALPACA_API_KEY")
 SECRET_KEY   = os.getenv("ALPACA_SECRET_KEY")
 PASSPHRASE   = os.getenv("WEBHOOK_PASSPHRASE")
-ALERT_SECRET = os.getenv("ALERT_SECRET")       # Pine Script "secret" field
+ALERT_SECRET = os.getenv("ALERT_SECRET")
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
-trading_client    = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
-stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+trading_client     = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
+stock_data_client  = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+option_data_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
 
-# Map Pine Script action names → (intent, side)
-# intent: "open" | "close"
-# side:   "buy" = CALL, "sell" = PUT, None = close
 ACTION_MAP = {
     "buy_call":   ("open",  "buy"),
     "buy_put":    ("open",  "sell"),
@@ -35,11 +34,31 @@ ACTION_MAP = {
     "close":      ("close", None),
 }
 
-def get_best_alpaca_contract(underlying_symbol, side, timeframe):
-    """side: 'buy'=CALL, 'sell'=PUT. Finds ATM contract for the given window."""
+_OPEN_STATUSES = {"new", "partially_filled", "accepted", "pending_new", "held"}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_option_mid_price(contract_symbol: str) -> float:
+    """Fetch bid/ask and return mid-price. Returns 0.0 if unavailable."""
     try:
-        quote_req = StockLatestQuoteRequest(symbol_or_symbols=[underlying_symbol])
-        quote = stock_data_client.get_stock_latest_quote(quote_req)
+        quotes = option_data_client.get_option_latest_quote(
+            OptionLatestQuoteRequest(symbol_or_symbols=contract_symbol)
+        )
+        q   = quotes.get(contract_symbol)
+        bid = float(q.bid_price or 0) if q else 0
+        ask = float(q.ask_price or 0) if q else 0
+        if ask <= 0:
+            return 0.0
+        return round((bid + ask) / 2, 2) if bid > 0 else ask
+    except Exception as e:
+        print(f"Could not fetch mid price for {contract_symbol}: {e}")
+        return 0.0
+
+def get_best_alpaca_contract(underlying_symbol: str, side: str, timeframe: str) -> str | None:
+    """Find ATM option contract. side: 'buy'=CALL, 'sell'=PUT."""
+    try:
+        quote_req     = StockLatestQuoteRequest(symbol_or_symbols=[underlying_symbol])
+        quote         = stock_data_client.get_stock_latest_quote(quote_req)
         current_price = quote[underlying_symbol].ask_price
 
         if timeframe == "60":
@@ -67,31 +86,29 @@ def get_best_alpaca_contract(underlying_symbol, side, timeframe):
             print(f"No contracts found for {underlying_symbol} ({side}) in {min_days}-{max_days} days.")
             return None
 
-        best_contract = min(contracts, key=lambda x: abs(float(x.strike_price) - current_price))
-        return best_contract.symbol
+        best = min(contracts, key=lambda x: abs(float(x.strike_price) - current_price))
+        return best.symbol
 
     except Exception as e:
         print(f"Error in contract search: {e}")
         return None
 
-def close_all_for_ticker(ticker):
-    """Close all open option positions for a specific underlying ticker."""
+def close_all_for_ticker(ticker: str) -> list:
+    """Market-close all option positions for ticker, falling back to all options."""
     try:
         positions = trading_client.get_all_positions()
-        closed = []
-        # Match by ticker prefix first; fall back to all option positions
-        matched = [p for p in positions if p.symbol.startswith(ticker)]
+        matched   = [p for p in positions if p.symbol.startswith(ticker)]
         if not matched:
             matched = [p for p in positions if len(p.symbol) > 6 and not p.symbol.isalpha()]
+        closed = []
         for p in matched:
             try:
-                order_data = MarketOrderRequest(
+                trading_client.submit_order(MarketOrderRequest(
                     symbol=p.symbol,
                     qty=p.qty,
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY
-                )
-                trading_client.submit_order(order_data)
+                ))
                 closed.append(p.symbol)
             except Exception:
                 pass
@@ -99,6 +116,33 @@ def close_all_for_ticker(ticker):
     except Exception as e:
         print(f"Error closing positions: {e}")
         return []
+
+async def _limit_timeout(order_id: str, symbol: str, qty: int, timeout_min: int):
+    """After timeout_min minutes, cancel unfilled limit order and replace with market."""
+    await asyncio.sleep(timeout_min * 60)
+    try:
+        order  = trading_client.get_order_by_id(order_id)
+        status = str(order.status).lower()
+        if status not in _OPEN_STATUSES:
+            return
+        filled    = int(float(order.filled_qty or 0))
+        remaining = qty - filled
+        try:
+            trading_client.cancel_order_by_id(order_id)
+        except Exception:
+            pass
+        if remaining > 0:
+            trading_client.submit_order(MarketOrderRequest(
+                symbol=symbol,
+                qty=remaining,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY
+            ))
+            print(f"Timeout: replaced limit with market for {symbol} x{remaining}")
+    except Exception as e:
+        print(f"Timeout handler error for {order_id}: {e}")
+
+# ── Flask app ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def health_check():
@@ -111,62 +155,40 @@ async def handle_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # Accept both "passphrase" (legacy/TradingView) and "secret" (Pine Script)
     incoming = data.get("passphrase") or data.get("secret")
     expected = PASSPHRASE or ALERT_SECRET
     if expected and incoming != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Clean ticker (e.g. NASDAQ:TSLA → TSLA)
-    ticker     = data.get("ticker", "").split(":")[-1]
-    raw_action = data.get("action", "").lower()
-    timeframe  = str(data.get("timeframe", "5"))
+    ticker      = data.get("ticker", "").split(":")[-1]
+    raw_action  = data.get("action", "").lower()
+    timeframe   = str(data.get("timeframe", "5"))
+    order_type  = (data.get("order_type") or "limit").lower()
+    timeout_min = int(data.get("timeout_min") or 5)
+    contracts   = int(data.get("contracts") or 1)
 
-    # Direct contract close — bypasses ticker search
+    # ── Direct contract close ─────────────────────────────────────────────────
     if raw_action == "close_contract":
         contract_symbol = data.get("contract")
         if not contract_symbol:
-            raise HTTPException(status_code=400, detail="Missing 'contract' field for close_contract")
+            raise HTTPException(status_code=400, detail="Missing 'contract' field")
         try:
             positions = trading_client.get_all_positions()
             pos = next((p for p in positions if p.symbol == contract_symbol), None)
             qty = int(float(pos.qty)) if pos else 1
-
-            # Try market order first; fall back to limit if Alpaca rejects (no quote)
             try:
-                order_request = MarketOrderRequest(
-                    symbol=contract_symbol,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY
-                )
-                submitted = trading_client.submit_order(order_request)
+                submitted = trading_client.submit_order(MarketOrderRequest(
+                    symbol=contract_symbol, qty=qty,
+                    side=OrderSide.SELL, time_in_force=TimeInForce.DAY
+                ))
             except Exception:
-                # Fetch mid price for limit order; use $0.01 if unavailable
-                try:
-                    from alpaca.data.historical import OptionHistoricalDataClient
-                    from alpaca.data.requests import OptionLatestQuoteRequest
-                    opt_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
-                    quote = opt_client.get_option_latest_quote(
-                        OptionLatestQuoteRequest(symbol_or_symbols=contract_symbol)
-                    )
-                    q = quote.get(contract_symbol)
-                    bid = float(q.bid_price or 0) if q else 0
-                    ask = float(q.ask_price or 0) if q else 0
-                    limit_price = round((bid + ask) / 2, 2) if ask > 0 else 0.01
-                except Exception:
-                    limit_price = 0.01
-
-                order_request = LimitOrderRequest(
-                    symbol=contract_symbol,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY,
-                    limit_price=limit_price
-                )
-                submitted = trading_client.submit_order(order_request)
-
-            return {"status": "success", "action": "close_contract", "contract": contract_symbol, "order_id": str(submitted.id)}
+                mid = get_option_mid_price(contract_symbol) or 0.01
+                submitted = trading_client.submit_order(LimitOrderRequest(
+                    symbol=contract_symbol, qty=qty, side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY, limit_price=mid
+                ))
+            return {"status": "success", "action": "close_contract",
+                    "contract": contract_symbol, "order_id": str(submitted.id)}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
@@ -176,33 +198,63 @@ async def handle_webhook(request: Request):
 
     intent, side = resolved
 
-    # CLOSE
+    # ── CLOSE ─────────────────────────────────────────────────────────────────
     if intent == "close":
         closed = close_all_for_ticker(ticker)
         return {"status": "success", "action": "close", "ticker": ticker, "contracts": closed}
 
-    # OPEN
+    # ── OPEN ──────────────────────────────────────────────────────────────────
     contract = get_best_alpaca_contract(ticker, side, timeframe)
     if not contract:
         return {"status": "error", "message": f"No ATM contract found for {ticker} ({side})"}
 
+    option_type = "CALL" if side == "buy" else "PUT"
+
     try:
-        order_request = MarketOrderRequest(
+        if order_type == "limit":
+            mid = get_option_mid_price(contract)
+            if mid > 0:
+                submitted = trading_client.submit_order(LimitOrderRequest(
+                    symbol=contract,
+                    qty=contracts,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=mid
+                ))
+                # Background timeout → cancel + market if unfilled
+                asyncio.create_task(_limit_timeout(
+                    str(submitted.id), contract, contracts, timeout_min
+                ))
+                return {
+                    "status":      "success",
+                    "action":      "open",
+                    "type":        option_type,
+                    "ticker":      ticker,
+                    "contract":    contract,
+                    "order_type":  "limit",
+                    "limit_price": mid,
+                    "timeout_min": timeout_min,
+                    "order_id":    str(submitted.id)
+                }
+            # No quote — fall through to market
+
+        # Market order (explicit or fallback)
+        submitted = trading_client.submit_order(MarketOrderRequest(
             symbol=contract,
-            qty=1,
+            qty=contracts,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY
-        )
-        submitted    = trading_client.submit_order(order_request)
-        option_type  = "CALL" if side == "buy" else "PUT"
+        ))
         return {
-            "status":   "success",
-            "action":   "open",
-            "type":     option_type,
-            "ticker":   ticker,
-            "contract": contract,
-            "order_id": str(submitted.id)
+            "status":     "success",
+            "action":     "open",
+            "type":       option_type,
+            "ticker":     ticker,
+            "contract":   contract,
+            "order_type": "market",
+            "order_id":   str(submitted.id)
         }
+
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
