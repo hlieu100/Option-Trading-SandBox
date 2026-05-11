@@ -125,13 +125,41 @@ async def handle_webhook(request: Request):
             positions = trading_client.get_all_positions()
             pos = next((p for p in positions if p.symbol == contract_symbol), None)
             qty = int(float(pos.qty)) if pos else 1
-            order_request = MarketOrderRequest(
-                symbol=contract_symbol,
-                qty=qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY
-            )
-            submitted = trading_client.submit_order(order_request)
+
+            # Try market order first; fall back to limit if Alpaca rejects (no quote)
+            try:
+                order_request = MarketOrderRequest(
+                    symbol=contract_symbol,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY
+                )
+                submitted = trading_client.submit_order(order_request)
+            except Exception:
+                # Fetch mid price for limit order; use $0.01 if unavailable
+                try:
+                    from alpaca.data.historical import OptionHistoricalDataClient
+                    from alpaca.data.requests import OptionLatestQuoteRequest
+                    opt_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
+                    quote = opt_client.get_option_latest_quote(
+                        OptionLatestQuoteRequest(symbol_or_symbols=contract_symbol)
+                    )
+                    q = quote.get(contract_symbol)
+                    bid = float(q.bid_price or 0) if q else 0
+                    ask = float(q.ask_price or 0) if q else 0
+                    limit_price = round((bid + ask) / 2, 2) if ask > 0 else 0.01
+                except Exception:
+                    limit_price = 0.01
+
+                order_request = LimitOrderRequest(
+                    symbol=contract_symbol,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price
+                )
+                submitted = trading_client.submit_order(order_request)
+
             return {"status": "success", "action": "close_contract", "contract": contract_symbol, "order_id": str(submitted.id)}
         except Exception as e:
             return {"status": "error", "message": str(e)}
