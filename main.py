@@ -80,7 +80,7 @@ def close_all_for_ticker(ticker):
         positions = trading_client.get_all_positions()
         closed = []
         for p in positions:
-            if ticker in p.symbol and p.asset_class.value == "us_option":
+            if ticker in p.symbol:
                 order_data = MarketOrderRequest(
                     symbol=p.symbol,
                     qty=p.qty,
@@ -115,6 +115,26 @@ async def handle_webhook(request: Request):
     ticker     = data.get("ticker", "").split(":")[-1]
     raw_action = data.get("action", "").lower()
     timeframe  = str(data.get("timeframe", "5"))
+
+    # Direct contract close — bypasses ticker search
+    if raw_action == "close_contract":
+        contract_symbol = data.get("contract")
+        if not contract_symbol:
+            raise HTTPException(status_code=400, detail="Missing 'contract' field for close_contract")
+        try:
+            positions = trading_client.get_all_positions()
+            pos = next((p for p in positions if p.symbol == contract_symbol), None)
+            qty = int(float(pos.qty)) if pos else 1
+            order_request = MarketOrderRequest(
+                symbol=contract_symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY
+            )
+            submitted = trading_client.submit_order(order_request)
+            return {"status": "success", "action": "close_contract", "contract": contract_symbol, "order_id": str(submitted.id)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
     resolved = ACTION_MAP.get(raw_action)
     if resolved is None:
