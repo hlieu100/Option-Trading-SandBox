@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
@@ -205,7 +206,7 @@ async def handle_webhook(request: Request):
     try:
         body = await request.body()
         print(f"RAW BODY: {body.decode()}")
-        data = __import__('json').loads(body)
+        data = json.loads(body)
     except Exception as e:
         print(f"JSON PARSE ERROR: {e} | body={body}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
