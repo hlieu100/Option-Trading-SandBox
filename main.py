@@ -94,8 +94,18 @@ def get_best_alpaca_contract(underlying_symbol: str, side: str, timeframe: str) 
         return None
 
 def close_all_for_ticker(ticker: str) -> list:
-    """Market-close all option positions for ticker, falling back to all options."""
+    """Cancel open buy orders then market-close all option positions for ticker."""
     try:
+        # Cancel any open buy orders to avoid wash trade rejection
+        try:
+            open_orders = trading_client.get_orders()
+            for o in open_orders:
+                if str(o.symbol).startswith(ticker) and str(o.side).lower() in ("buy", "orderside.buy"):
+                    trading_client.cancel_order_by_id(str(o.id))
+                    print(f"Cancelled open buy order {o.id} for {o.symbol}")
+        except Exception as ce:
+            print(f"Could not cancel open orders: {ce}")
+
         positions = trading_client.get_all_positions()
         matched   = [p for p in positions if p.symbol.startswith(ticker)]
         if not matched:
@@ -173,6 +183,16 @@ async def handle_webhook(request: Request):
         if not contract_symbol:
             raise HTTPException(status_code=400, detail="Missing 'contract' field")
         try:
+            # Cancel any open buy orders first to avoid wash trade rejection
+            try:
+                open_orders = trading_client.get_orders()
+                for o in open_orders:
+                    if str(o.symbol) == contract_symbol and str(o.side).lower() in ("buy", "orderside.buy"):
+                        trading_client.cancel_order_by_id(str(o.id))
+                        print(f"Cancelled open buy order {o.id} for {contract_symbol}")
+            except Exception as ce:
+                print(f"Could not cancel open orders: {ce}")
+
             positions = trading_client.get_all_positions()
             pos = next((p for p in positions if p.symbol == contract_symbol), None)
             qty = int(float(pos.qty)) if pos else 1
