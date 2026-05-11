@@ -203,9 +203,12 @@ def debug_price(ticker: str):
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        body = await request.body()
+        print(f"RAW BODY: {body.decode()}")
+        data = __import__('json').loads(body)
+    except Exception as e:
+        print(f"JSON PARSE ERROR: {e} | body={body}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
     incoming = data.get("passphrase") or data.get("secret")
     expected = PASSPHRASE or ALERT_SECRET
