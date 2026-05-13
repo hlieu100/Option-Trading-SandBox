@@ -1,11 +1,13 @@
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta
+import re
+import urllib.request as _urllib_req
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, HTTPException
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOptionContractsRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetStatus, ContractType
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOptionContractsRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetStatus, ContractType, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest, OptionLatestQuoteRequest
 from dotenv import load_dotenv
@@ -15,11 +17,12 @@ load_dotenv()
 app = FastAPI()
 
 # --- CONFIGURATION ---
-API_KEY      = os.getenv("ALPACA_API_KEY")
-SECRET_KEY   = os.getenv("ALPACA_SECRET_KEY")
-PASSPHRASE   = os.getenv("WEBHOOK_PASSPHRASE")
-ALERT_SECRET = os.getenv("ALERT_SECRET")
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+API_KEY              = os.getenv("ALPACA_API_KEY")
+SECRET_KEY           = os.getenv("ALPACA_SECRET_KEY")
+PASSPHRASE           = os.getenv("WEBHOOK_PASSPHRASE")
+ALERT_SECRET         = os.getenv("ALERT_SECRET")
+ALPACA_PAPER         = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+DISCORD_WEBHOOK_URL  = os.getenv("DISCORD_WEBHOOK_URL")
 
 trading_client     = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
 stock_data_client  = StockHistoricalDataClient(API_KEY, SECRET_KEY)
@@ -323,6 +326,131 @@ async def handle_webhook(request: Request):
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# ── P&L Report ────────────────────────────────────────────────────────────────
+
+def _underlying(symbol: str) -> str:
+    """Extract underlying ticker from an OCC option symbol or return as-is."""
+    m = re.match(r'^([A-Z]+)\d', str(symbol))
+    return m.group(1) if m else str(symbol)
+
+
+def _discord_post(payload: dict):
+    """POST a JSON payload to the Discord webhook (no-op if URL not set)."""
+    if not DISCORD_WEBHOOK_URL:
+        print("DISCORD_WEBHOOK_URL not set — skipping Discord post")
+        return
+    data = json.dumps(payload).encode()
+    req  = _urllib_req.Request(
+        DISCORD_WEBHOOK_URL, data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    _urllib_req.urlopen(req, timeout=10)
+
+
+@app.get("/report")
+def pnl_report():
+    """
+    Fetch today's intraday P&L from Alpaca, break it down per ticker,
+    and send a Discord embed with realized + unrealized totals.
+    """
+    try:
+        today = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+        # ── Closed orders today ───────────────────────────────────────────────
+        orders = trading_client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            after=today,
+            limit=200,
+        ))
+
+        pnl: dict = {}
+        for o in orders:
+            if "filled" not in str(o.status).lower():
+                continue
+            sym    = str(o.symbol)
+            ticker = _underlying(sym)
+            qty    = float(o.filled_qty or 0)
+            price  = float(o.filled_avg_price or 0)
+            mult   = 100 if (len(sym) > 6 and not sym.isalpha()) else 1
+            side   = str(o.side).lower()
+
+            entry = pnl.setdefault(ticker, {"realized": 0.0, "buys": 0, "sells": 0})
+            if "sell" in side:
+                entry["realized"] += qty * price * mult
+                entry["sells"]    += 1
+            else:
+                entry["realized"] -= qty * price * mult
+                entry["buys"]     += 1
+
+        # ── Open positions (unrealized) ───────────────────────────────────────
+        positions = trading_client.get_all_positions()
+        open_pnl: dict = {}
+        for p in positions:
+            ticker = _underlying(str(p.symbol))
+            open_pnl[ticker] = open_pnl.get(ticker, 0.0) + float(p.unrealized_pl or 0)
+
+        # ── Account equity ────────────────────────────────────────────────────
+        account  = trading_client.get_account()
+        equity   = float(account.equity or 0)
+        total_r  = sum(v["realized"] for v in pnl.values())
+        total_u  = sum(open_pnl.values())
+
+        # ── Build Discord embed fields ────────────────────────────────────────
+        fields = []
+        for ticker, data in sorted(pnl.items()):
+            r     = data["realized"]
+            emoji = "🟢" if r >= 0 else "🔴"
+            upl   = open_pnl.get(ticker, None)
+            upl_line = f"\nUnrealized: **${upl:+,.2f}**" if upl is not None else ""
+            fields.append({
+                "name":   f"{emoji} {ticker}",
+                "value":  f"Realized: **${r:+,.2f}**\nBuys: {data['buys']} | Sells: {data['sells']}{upl_line}",
+                "inline": True,
+            })
+
+        # Tickers with open positions but no closed trades today
+        for ticker, upl in sorted(open_pnl.items()):
+            if ticker not in pnl:
+                fields.append({
+                    "name":   f"🟡 {ticker} (open only)",
+                    "value":  f"Unrealized: **${upl:+,.2f}**",
+                    "inline": True,
+                })
+
+        if not fields:
+            fields = [{"name": "No activity today", "value": "No filled orders yet.", "inline": False}]
+
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        _discord_post({
+            "embeds": [{
+                "title":  f"📊 Intraday P&L — {date_str}",
+                "color":  0x00b300 if total_r >= 0 else 0xcc0000,
+                "fields": fields,
+                "footer": {
+                    "text": (
+                        f"Realized: ${total_r:+,.2f}  •  "
+                        f"Unrealized: ${total_u:+,.2f}  •  "
+                        f"Equity: ${equity:,.2f}"
+                    )
+                },
+            }]
+        })
+
+        return {
+            "status":           "sent",
+            "date":             date_str,
+            "total_realized":   round(total_r, 2),
+            "total_unrealized": round(total_u, 2),
+            "by_ticker":        {k: round(v["realized"], 2) for k, v in pnl.items()},
+        }
+
+    except Exception as e:
+        print(f"Report error: {e}")
+        return {"status": "error", "message": str(e)}
+
 
 if __name__ == "__main__":
     import uvicorn
